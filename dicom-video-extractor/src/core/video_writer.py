@@ -60,6 +60,7 @@ class VideoWriter:
         self._frames_written = 0
 
     def __enter__(self) -> "VideoWriter":
+        self._output.parent.mkdir(parents=True, exist_ok=True)
         ext = self._output.suffix.lower().lstrip(".")
         pix_fmt = "gray" if self._is_grayscale else "rgb24"
         codec_args = get_codec_args(self._preset, ext, self._is_grayscale)
@@ -158,6 +159,7 @@ class StreamCopyWriter:
 
     def write_stream(self, data: bytes) -> None:
         """Write a complete elementary stream in one call."""
+        self._output.parent.mkdir(parents=True, exist_ok=True)
         cmd = build_streamcopy_command(self._ffmpeg, str(self._output))
         logger.info("Stream-copy FFmpeg: %s", " ".join(cmd))
 
