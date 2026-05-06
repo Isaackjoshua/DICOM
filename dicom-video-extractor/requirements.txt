@@ -1,0 +1,16 @@
+pydicom>=2.4
+pylibjpeg>=2.0
+pylibjpeg-libjpeg>=2.1
+pylibjpeg-openjpeg>=2.4
+pylibjpeg-rle>=2.0
+python-gdcm>=3.0
+numpy>=1.26
+opencv-python-headless>=4.9
+PyQt6>=6.6
+ffmpeg-python>=0.2
+
+# dev / test
+pytest>=8.0
+pytest-qt>=4.4
+pytest-cov>=5.0
+ruff>=0.4
