@@ -1,26 +1,50 @@
 """
-Lazy frame iterator that yields one processed uint8 numpy frame at a time.
-Never materialises the full (N, H, W[, 3]) array for large files.
+Lazy frame iterator using pydicom 3's iter_pixels API.
+
+iter_pixels handles all transfer syntaxes (JPEG, JPEG-LS, JPEG 2000, RLE,
+uncompressed, Big Endian) and converts YBR_FULL / YBR_FULL_422 → RGB automatically.
+Passing the file path (rather than a pre-loaded Dataset) keeps memory flat for
+large cine loops — only one decoded frame lives in memory at a time.
 """
 
 import logging
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import pydicom
-from pydicom.encaps import generate_pixel_data_frame
+from pydicom.pixels import iter_pixels
 
 from src.core.pixel_pipeline import VolumeScalars, build_volume_scalars, process_frame
 from src.utils.exceptions import MissingPixelDataError, UnsupportedTransferSyntaxError
 
 logger = logging.getLogger(__name__)
 
-# Transfer syntaxes that are plain uncompressed pixel data
-UNCOMPRESSED_SYNTAXES = frozenset({
-    "1.2.840.10008.1.2",    # Implicit VR LE
-    "1.2.840.10008.1.2.1",  # Explicit VR LE
-    "1.2.840.10008.1.2.2",  # Explicit VR BE
+# Transfer syntaxes whose PixelData is an already-encoded video stream
+PASSTHROUGH_SYNTAXES = frozenset({
+    "1.2.840.10008.1.2.4.100",
+    "1.2.840.10008.1.2.4.101",
+    "1.2.840.10008.1.2.4.102",
+    "1.2.840.10008.1.2.4.103",
+    "1.2.840.10008.1.2.4.104",
+    "1.2.840.10008.1.2.4.105",
+    "1.2.840.10008.1.2.4.106",
+    "1.2.840.10008.1.2.4.107",
+    "1.2.840.10008.1.2.4.108",
+    "1.2.840.10008.1.2.4.201",
+    "1.2.840.10008.1.2.4.202",
+    "1.2.840.10008.1.2.4.203",
+    "1.2.840.10008.1.2.4.204",
+    "1.2.840.10008.1.2.4.205",
+})
+
+# After iter_pixels(raw=False), YBR frames are converted to RGB
+_YBR_OUTPUTS_AS_RGB = frozenset({
+    "YBR_FULL",
+    "YBR_FULL_422",
+    "YBR_PARTIAL_422",
+    "YBR_PARTIAL_420",
 })
 
 
@@ -35,117 +59,62 @@ def iter_frames(
 
     Parameters
     ----------
-    ds          : loaded pydicom Dataset (pixel data present)
-    ts_uid      : transfer syntax UID string (read from file_meta before calling)
-    raw_mode    : skip windowing / scaling — pass frames through mostly raw
-    cancel_event: threading.Event; iteration stops cleanly when set
+    ds          : loaded Dataset (from open_dataset — deferred pixel data is fine)
+    ts_uid      : transfer syntax UID (read from file_meta before calling)
+    raw_mode    : skip VOI LUT and 8-bit mapping — return nearly-raw data
+    cancel_event: threading.Event; iteration stops when set
     """
+    if ts_uid in PASSTHROUGH_SYNTAXES:
+        raise UnsupportedTransferSyntaxError(
+            ts_uid,
+            "Passthrough syntax — call conversion_service for stream-copy path.",
+        )
+
     if not hasattr(ds, "PixelData"):
         raise MissingPixelDataError("Dataset has no PixelData.")
 
+    photometric = (getattr(ds, "PhotometricInterpretation", "") or "").strip()
     num_frames = int(getattr(ds, "NumberOfFrames", 1) or 1)
+    bits_alloc = int(getattr(ds, "BitsAllocated", 8) or 8)
     rows = int(ds.Rows)
     cols = int(ds.Columns)
-    bits_alloc = int(getattr(ds, "BitsAllocated", 8))
-    samples_per_pixel = int(getattr(ds, "SamplesPerPixel", 1))
-    is_encapsulated = ts_uid not in UNCOMPRESSED_SYNTAXES
 
     logger.info(
-        "Extracting %d frame(s), %dx%d, %d-bit, %d spp, encapsulated=%s",
-        num_frames, cols, rows, bits_alloc, samples_per_pixel, is_encapsulated,
+        "iter_frames: %d frame(s), %dx%d, %d-bit, pi=%s, ts=%s",
+        num_frames, cols, rows, bits_alloc, photometric, ts_uid,
     )
 
-    scalars: Optional[VolumeScalars] = None
-
-    if is_encapsulated:
-        yield from _iter_encapsulated(
-            ds, ts_uid, num_frames, raw_mode, cancel_event,
-            rows, cols, scalars
-        )
-    else:
-        yield from _iter_uncompressed(
-            ds, num_frames, bits_alloc, samples_per_pixel,
-            rows, cols, raw_mode, cancel_event
-        )
-
-
-def _iter_uncompressed(
-    ds: pydicom.Dataset,
-    num_frames: int,
-    bits_alloc: int,
-    samples_per_pixel: int,
-    rows: int,
-    cols: int,
-    raw_mode: bool,
-    cancel_event,
-) -> Iterator[np.ndarray]:
-    pixel_bytes: bytes = ds.PixelData
-    dtype = np.uint16 if bits_alloc == 16 else np.uint8
-    frame_pixels = rows * cols * samples_per_pixel
-    frame_bytes = frame_pixels * (bits_alloc // 8)
+    # iter_pixels converts YBR → RGB, so tell the pipeline the frames are RGB
+    effective_photometric = "RGB" if photometric in _YBR_OUTPUTS_AS_RGB else photometric
 
     scalars: Optional[VolumeScalars] = None
 
-    for i in range(num_frames):
-        if cancel_event and cancel_event.is_set():
-            logger.info("Frame extraction cancelled at frame %d.", i)
-            return
+    src = Path(ds.filename) if hasattr(ds, "filename") and ds.filename else ds
 
-        start = i * frame_bytes
-        raw = pixel_bytes[start: start + frame_bytes]
-        frame = np.frombuffer(raw, dtype=dtype).reshape(
-            (rows, cols, samples_per_pixel) if samples_per_pixel > 1 else (rows, cols)
-        ).copy()
-
-        if scalars is None:
-            scalars = build_volume_scalars(frame, ds)
-
-        yield process_frame(frame, ds, scalars, raw_mode=raw_mode)
-
-
-def _iter_encapsulated(
-    ds: pydicom.Dataset,
-    ts_uid: str,
-    num_frames: int,
-    raw_mode: bool,
-    cancel_event,
-    rows: int,
-    cols: int,
-    scalars: Optional[VolumeScalars],
-) -> Iterator[np.ndarray]:
     try:
-        pixel_data = ds.PixelData
-        frame_gen = generate_pixel_data_frame(pixel_data, num_frames)
+        frame_gen = iter_pixels(src, raw=False)
     except Exception as exc:
         raise UnsupportedTransferSyntaxError(ts_uid, str(exc)) from exc
 
-    for i, frame_bytes in enumerate(frame_gen):
+    for idx, raw_frame in enumerate(frame_gen):
         if cancel_event and cancel_event.is_set():
-            logger.info("Frame extraction cancelled at frame %d.", i)
+            logger.info("Frame extraction cancelled at frame %d.", idx)
             return
 
-        try:
-            # Let pydicom's configured handlers decode this fragment
-            frame_ds = _make_single_frame_ds(ds, frame_bytes)
-            frame = frame_ds.pixel_array
-        except Exception as exc:
-            raise UnsupportedTransferSyntaxError(
-                ts_uid, f"Failed to decode frame {i}: {exc}"
-            ) from exc
-
         if scalars is None:
-            scalars = build_volume_scalars(frame, ds)
+            scalars = build_volume_scalars(raw_frame, ds)
+            logger.info(
+                "Volume scalars locked: p_low=%.1f p_high=%.1f windowing=%s",
+                scalars.p_low, scalars.p_high, scalars.used_windowing,
+            )
 
-        yield process_frame(frame, ds, scalars, raw_mode=raw_mode)
+        yield process_frame(
+            raw_frame,
+            ds,
+            scalars,
+            raw_mode=raw_mode,
+            photometric_override=effective_photometric,
+        )
 
-
-def _make_single_frame_ds(ds: pydicom.Dataset, frame_bytes: bytes) -> pydicom.Dataset:
-    """Create a minimal single-frame Dataset for decoding one fragment."""
-    import copy
-    from pydicom.encaps import encapsulate
-
-    mini = copy.copy(ds)
-    mini.NumberOfFrames = 1
-    mini.PixelData = encapsulate([frame_bytes])
-    mini["PixelData"].is_undefined_length = True
-    return mini
+        if idx + 1 >= num_frames:
+            break  # guard against iter_pixels yielding extra frames

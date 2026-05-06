@@ -7,6 +7,7 @@ from typing import Optional
 from PyQt6.QtCore import Qt, QThread
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -125,6 +126,13 @@ class MainWindow(QMainWindow):
         self._preset_combo.addItems(PRESETS)
         details_layout.addWidget(self._preset_combo)
 
+        self._force_reencode_chk = QCheckBox("Force Re-encode (MPEG files)")
+        self._force_reencode_chk.setToolTip(
+            "By default, MPEG/H.264/HEVC-encapsulated files are stream-copied "
+            "(zero re-encode). Enable this to decode and re-encode instead."
+        )
+        details_layout.addWidget(self._force_reencode_chk)
+
         details_layout.addWidget(QLabel("Output Folder:"))
         out_row = QHBoxLayout()
         self._lbl_out = QLabel("Same as input")
@@ -231,11 +239,24 @@ class MainWindow(QMainWindow):
         self._table.setItem(row, 0, QTableWidgetItem(info.path.name))
         self._table.setItem(row, 1, QTableWidgetItem(info.modality))
         self._table.setItem(row, 2, QTableWidgetItem(str(info.num_frames)))
-        ts_display = f"{info.transfer_syntax_name} ({info.transfer_syntax_uid})"
-        self._table.setItem(row, 3, QTableWidgetItem(ts_display))
+
+        passthrough_tag = " [passthrough]" if info.is_passthrough else ""
+        ts_display = f"{info.transfer_syntax_name}{passthrough_tag}"
+        ts_item = QTableWidgetItem(ts_display)
+        if info.is_passthrough:
+            ts_item.setForeground(Qt.GlobalColor.cyan)
+        self._table.setItem(row, 3, ts_item)
+
         self._table.setItem(row, 4, QTableWidgetItem(f"{fps.fps:.2f} [{fps.source}]"))
-        self._table.setItem(row, 5, QTableWidgetItem("Queued"))
-        # Store the path in the row for retrieval
+
+        status_text = "Queued"
+        if info.is_spatial_stack:
+            status_text = "Spatial stack ⚠"
+        status_item = QTableWidgetItem(status_text)
+        if info.is_spatial_stack:
+            status_item.setForeground(Qt.GlobalColor.yellow)
+        self._table.setItem(row, 5, status_item)
+
         self._table.item(row, 0).setData(Qt.ItemDataRole.UserRole, path_str)
 
     def _clear_files(self) -> None:
@@ -289,6 +310,7 @@ class MainWindow(QMainWindow):
         fmt = self._fmt_combo.currentText().lower()
         fps_override = self._fps_spin.value() if self._fps_spin.value() > 0 else None
 
+        force_reencode = self._force_reencode_chk.isChecked()
         requests: list[ConversionRequest] = []
         for path_str, info in self._file_infos.items():
             out_dir = self._output_dir or info.path.parent
@@ -298,6 +320,7 @@ class MainWindow(QMainWindow):
                 output_path=out_path,
                 preset=preset,
                 fps_override=fps_override,
+                force_reencode=force_reencode,
             ))
 
         self._progress.reset(len(requests))

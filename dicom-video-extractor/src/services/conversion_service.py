@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import pydicom
-from pydicom.encaps import generate_pixel_data_frame
+from pydicom.encaps import generate_frames as generate_pixel_data_frame
 
 from src.core.dicom_reader import (
     PASSTHROUGH_SYNTAXES,
@@ -142,7 +142,7 @@ def _passthrough_convert(
 ) -> ConversionResult:
     _log("Concatenating encapsulated stream fragments…")
     fragments: list[bytes] = []
-    for fragment in generate_pixel_data_frame(ds.PixelData, info.num_frames):
+    for fragment in generate_pixel_data_frame(ds.PixelData, number_of_frames=info.num_frames):
         fragments.append(fragment)
     stream_data = b"".join(fragments)
     _log(f"Stream size: {len(stream_data) / 1024 / 1024:.1f} MB")

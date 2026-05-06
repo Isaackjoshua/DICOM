@@ -7,6 +7,7 @@ from pathlib import Path
 from PyQt6.QtWidgets import QApplication
 
 from src.utils.logging_setup import setup_logging
+from src.utils.handlers import configure_handlers
 from src.utils.ffmpeg_utils import probe_ffmpeg
 from src.utils.exceptions import FFmpegNotFoundError
 from src.ui.main_window import MainWindow
@@ -15,6 +16,7 @@ from src.ui.main_window import MainWindow
 def main() -> None:
     setup_logging()
     logger = logging.getLogger(__name__)
+    configure_handlers()
 
     app = QApplication(sys.argv)
     app.setApplicationName("DICOM Video Extractor")
