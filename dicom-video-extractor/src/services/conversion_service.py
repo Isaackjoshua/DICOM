@@ -2,6 +2,7 @@
 
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -48,6 +49,14 @@ class ConversionResult:
     fps_result: Optional[FpsResult] = None
     warnings: list[str] = field(default_factory=list)
     error: Optional[str] = None
+    started_at: Optional[float] = None   # time.time() epoch
+    finished_at: Optional[float] = None  # time.time() epoch
+
+    @property
+    def duration_seconds(self) -> Optional[float]:
+        if self.started_at is not None and self.finished_at is not None:
+            return self.finished_at - self.started_at
+        return None
 
 
 ProgressCallback = Callable[[int, int], None]  # (current_frame, total_frames)
@@ -74,6 +83,7 @@ def convert(
         input_path=request.input_path,
         output_path=request.output_path,
         success=False,
+        started_at=time.time(),
     )
 
     try:
@@ -116,16 +126,19 @@ def convert(
 
     except (DicomValidationError, MissingPixelDataError, UnsupportedTransferSyntaxError) as exc:
         result.error = str(exc)
+        result.finished_at = time.time()
         _log(str(exc), "ERROR")
         return result
     except FFmpegEncodingError as exc:
         result.error = str(exc)
+        result.finished_at = time.time()
         _log(str(exc), "ERROR")
         if exc.stderr_tail:
             _log(f"FFmpeg stderr:\n{exc.stderr_tail}", "ERROR")
         return result
     except Exception as exc:
         result.error = f"Unexpected error: {exc}"
+        result.finished_at = time.time()
         _log(result.error, "ERROR")
         logger.exception("Unexpected error during conversion of '%s'", request.input_path)
         return result
@@ -156,6 +169,7 @@ def _passthrough_convert(
 
     result.success = True
     result.frames_written = info.num_frames
+    result.finished_at = time.time()
     _log(f"Stream-copy complete → '{request.output_path}'")
     return result
 
@@ -211,6 +225,7 @@ def _frame_encode(
         return result
 
     result.success = True
+    result.finished_at = time.time()
     _log(
         f"Done — wrote {result.frames_written}/{total} frames → '{request.output_path}'"
     )

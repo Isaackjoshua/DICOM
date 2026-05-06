@@ -28,7 +28,10 @@ from PyQt6.QtWidgets import (
 
 from src.core.dicom_reader import DicomFileInfo, validate_and_load
 from src.core.fps_resolver import FpsResult, resolve_fps
+from src.services.anonymizer import write_anonymized_copy
+from src.services.batch_service import BatchJob, BatchQueue
 from src.services.conversion_service import ConversionRequest
+from src.services.report_service import save_csv_report, save_json_report
 from src.ui.metadata_dialog import MetadataDialog
 from src.ui.widgets import DropZone, DualProgressBar, LogPanel
 from src.ui.worker import ConversionWorker, make_worker_thread
@@ -41,15 +44,26 @@ FILE_COLUMNS = ["Name", "Modality", "Frames", "Transfer Syntax", "FPS", "Status"
 PRESETS = ["High", "Lossless", "Compressed"]
 FORMATS = ["MP4", "AVI", "MKV"]
 
+_STATUS_COLORS = {
+    "Queued":    None,
+    "Running":   Qt.GlobalColor.cyan,
+    "Done":      Qt.GlobalColor.green,
+    "Failed":    Qt.GlobalColor.red,
+    "Cancelled": Qt.GlobalColor.yellow,
+    "Spatial stack ⚠": Qt.GlobalColor.yellow,
+}
+
 
 class MainWindow(QMainWindow):
     def __init__(self, ffmpeg_info: Optional[FFmpegInfo], parent=None):
         super().__init__(parent)
         self._ffmpeg_info = ffmpeg_info
-        self._file_infos: dict[str, DicomFileInfo] = {}   # path_str → info
+        self._file_infos: dict[str, DicomFileInfo] = {}
         self._fps_results: dict[str, FpsResult] = {}
+        self._queue = BatchQueue()
         self._worker: Optional[ConversionWorker] = None
         self._thread: Optional[QThread] = None
+        self._output_dir: Optional[Path] = None
 
         self.setWindowTitle("DICOM → Video Extractor")
         self.setMinimumSize(1100, 700)
@@ -71,7 +85,7 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(central)
         root.setSpacing(6)
 
-        # Drop zone + buttons
+        # Drop zone + add/clear buttons
         top = QHBoxLayout()
         self._drop_zone = DropZone()
         self._drop_zone.files_dropped.connect(self._add_files)
@@ -172,8 +186,6 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self._btn_cancel)
         root.addLayout(btn_row)
 
-        self._output_dir: Optional[Path] = None
-
     def _build_menu(self) -> None:
         menubar = self.menuBar()
 
@@ -185,6 +197,9 @@ class MainWindow(QMainWindow):
 
         tools_menu = menubar.addMenu("&Tools")
         tools_menu.addAction("View Metadata", self._view_metadata)
+        tools_menu.addAction("Anonymize Copy…", self._anonymize_copy)
+        tools_menu.addAction("Export JSON Report…", self._export_json_report)
+        tools_menu.addAction("Export CSV Report…", self._export_csv_report)
 
         help_menu = menubar.addMenu("&Help")
         help_menu.addAction("About", self._show_about)
@@ -211,14 +226,13 @@ class MainWindow(QMainWindow):
         for path_str in paths:
             path = Path(path_str)
             if path_str in self._file_infos:
-                continue  # already queued
+                continue
             try:
                 info = validate_and_load(path)
             except (DicomValidationError, MissingPixelDataError) as exc:
                 self._log(f"Skipped '{path.name}': {exc}", "WARNING")
                 continue
 
-            # Resolve FPS (open dataset to read timing tags)
             try:
                 import pydicom
                 ds = pydicom.dcmread(path_str, stop_before_pixels=True)
@@ -236,33 +250,44 @@ class MainWindow(QMainWindow):
     def _add_table_row(self, path_str: str, info: DicomFileInfo, fps: FpsResult) -> None:
         row = self._table.rowCount()
         self._table.insertRow(row)
-        self._table.setItem(row, 0, QTableWidgetItem(info.path.name))
+
+        name_item = QTableWidgetItem(info.path.name)
+        name_item.setData(Qt.ItemDataRole.UserRole, path_str)
+        self._table.setItem(row, 0, name_item)
         self._table.setItem(row, 1, QTableWidgetItem(info.modality))
         self._table.setItem(row, 2, QTableWidgetItem(str(info.num_frames)))
 
         passthrough_tag = " [passthrough]" if info.is_passthrough else ""
-        ts_display = f"{info.transfer_syntax_name}{passthrough_tag}"
-        ts_item = QTableWidgetItem(ts_display)
+        ts_item = QTableWidgetItem(f"{info.transfer_syntax_name}{passthrough_tag}")
         if info.is_passthrough:
             ts_item.setForeground(Qt.GlobalColor.cyan)
         self._table.setItem(row, 3, ts_item)
 
         self._table.setItem(row, 4, QTableWidgetItem(f"{fps.fps:.2f} [{fps.source}]"))
 
-        status_text = "Queued"
-        if info.is_spatial_stack:
-            status_text = "Spatial stack ⚠"
+        status_text = "Spatial stack ⚠" if info.is_spatial_stack else "Queued"
         status_item = QTableWidgetItem(status_text)
-        if info.is_spatial_stack:
-            status_item.setForeground(Qt.GlobalColor.yellow)
+        color = _STATUS_COLORS.get(status_text)
+        if color:
+            status_item.setForeground(color)
         self._table.setItem(row, 5, status_item)
 
-        self._table.item(row, 0).setData(Qt.ItemDataRole.UserRole, path_str)
+    def _set_row_status(self, path_str: str, status: str) -> None:
+        for row in range(self._table.rowCount()):
+            item = self._table.item(row, 0)
+            if item and item.data(Qt.ItemDataRole.UserRole) == path_str:
+                s = QTableWidgetItem(status)
+                color = _STATUS_COLORS.get(status)
+                if color:
+                    s.setForeground(color)
+                self._table.setItem(row, 5, s)
+                return
 
     def _clear_files(self) -> None:
         self._table.setRowCount(0)
         self._file_infos.clear()
         self._fps_results.clear()
+        self._queue.clear_all()
 
     def _choose_output_dir(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Select Output Folder")
@@ -289,7 +314,8 @@ class MainWindow(QMainWindow):
         if info:
             self._lbl_file.setText(
                 f"{info.path.name}\n"
-                f"{info.columns}×{info.rows}  {info.bits_stored}-bit  {info.photometric_interpretation}"
+                f"{info.columns}×{info.rows}  {info.bits_stored}-bit  "
+                f"{info.photometric_interpretation}"
             )
         if fps:
             self._fps_spin.setValue(fps.fps)
@@ -309,29 +335,34 @@ class MainWindow(QMainWindow):
         preset = self._preset_combo.currentText().lower()
         fmt = self._fmt_combo.currentText().lower()
         fps_override = self._fps_spin.value() if self._fps_spin.value() > 0 else None
-
         force_reencode = self._force_reencode_chk.isChecked()
-        requests: list[ConversionRequest] = []
+
+        # Build a fresh BatchQueue from the current file list
+        self._queue.clear_all()
         for path_str, info in self._file_infos.items():
             out_dir = self._output_dir or info.path.parent
             out_path = out_dir / (info.path.stem + f".{fmt}")
-            requests.append(ConversionRequest(
+            req = ConversionRequest(
                 input_path=info.path,
                 output_path=out_path,
                 preset=preset,
                 fps_override=fps_override,
                 force_reencode=force_reencode,
-            ))
+            )
+            self._queue.add(req)
 
-        self._progress.reset(len(requests))
+        self._progress.reset(len(self._queue))
         self._btn_convert.setEnabled(False)
         self._btn_cancel.setEnabled(True)
 
-        self._worker = ConversionWorker(requests, self._ffmpeg_info.path)
+        self._worker = ConversionWorker(self._queue, self._ffmpeg_info.path)
         self._thread = make_worker_thread(self._worker)
 
         self._worker.progress.connect(self._progress.update_file_progress)
         self._worker.log.connect(self._log)
+        self._worker.file_started.connect(
+            lambda p: self._set_row_status(p, "Running")
+        )
         self._worker.file_done.connect(self._on_file_done)
         self._worker.finished.connect(self._on_finished)
 
@@ -340,27 +371,33 @@ class MainWindow(QMainWindow):
     def _cancel_conversion(self) -> None:
         if self._worker:
             self._worker.cancel()
-            self._log("Cancellation requested…", "WARNING")
+            self._log("Cancellation requested — stopping after current frame.", "WARNING")
             self._btn_cancel.setEnabled(False)
 
     def _on_file_done(self, path_str: str, success: bool) -> None:
         self._progress.file_complete()
-        # Update status column
-        for row in range(self._table.rowCount()):
-            item = self._table.item(row, 0)
-            if item and item.data(Qt.ItemDataRole.UserRole) == path_str:
-                status_item = self._table.item(row, 5)
-                if status_item:
-                    status_item.setText("Done" if success else "Failed")
-                break
+        # Find the job to determine exact status (done / failed / cancelled)
+        job = self._queue.get_by_path(path_str)
+        if job:
+            label = {"done": "Done", "failed": "Failed", "cancelled": "Cancelled"}.get(
+                job.status, "Done" if success else "Failed"
+            )
+            self._set_row_status(path_str, label)
 
     def _on_finished(self) -> None:
         self._btn_convert.setEnabled(True)
         self._btn_cancel.setEnabled(False)
-        self._log("All conversions complete.", "INFO")
+        stats = self._queue.stats()
+        self._log(
+            f"Batch complete — {stats.done} done, {stats.failed} failed, "
+            f"{stats.cancelled} cancelled, {stats.total_frames} total frames.",
+            "INFO",
+        )
+        if stats.done > 0:
+            self._log("Use Tools → Export JSON/CSV Report to save a processing report.", "INFO")
 
     # ------------------------------------------------------------------
-    # Menus / dialogs
+    # Tools menu actions
     # ------------------------------------------------------------------
 
     def _view_metadata(self) -> None:
@@ -375,6 +412,80 @@ class MainWindow(QMainWindow):
         path_str = item.data(Qt.ItemDataRole.UserRole)
         dlg = MetadataDialog(Path(path_str), self)
         dlg.exec()
+
+    def _anonymize_copy(self) -> None:
+        paths = self._get_selected_paths()
+        if not paths:
+            QMessageBox.information(
+                self, "No Selection", "Select one or more files in the list first."
+            )
+            return
+
+        dst_dir = QFileDialog.getExistingDirectory(
+            self, "Select Destination Folder for Anonymized Copies"
+        )
+        if not dst_dir:
+            return
+        dst_path = Path(dst_dir)
+
+        errors: list[str] = []
+        successes: int = 0
+        for path_str in paths:
+            src = Path(path_str)
+            dst = dst_path / ("anon_" + src.name)
+            try:
+                write_anonymized_copy(src, dst)
+                self._log(f"Anonymized copy → '{dst}'", "INFO")
+                successes += 1
+            except Exception as exc:
+                msg = f"Failed to anonymize '{src.name}': {exc}"
+                self._log(msg, "ERROR")
+                errors.append(msg)
+
+        summary = f"Anonymized {successes} file(s)."
+        if errors:
+            summary += f"\n{len(errors)} file(s) failed — see log panel."
+        QMessageBox.information(self, "Anonymization Complete", summary)
+
+    def _export_json_report(self) -> None:
+        self._export_report(fmt="json")
+
+    def _export_csv_report(self) -> None:
+        self._export_report(fmt="csv")
+
+    def _export_report(self, fmt: str) -> None:
+        jobs = self._queue.all_jobs()
+        completed = [j for j in jobs if j.is_terminal]
+        if not completed:
+            QMessageBox.information(
+                self, "No Data",
+                "No completed conversions to report.\nRun a conversion first."
+            )
+            return
+
+        filter_str = "JSON Files (*.json)" if fmt == "json" else "CSV Files (*.csv)"
+        default_name = f"dicom_report.{fmt}"
+        path_str, _ = QFileDialog.getSaveFileName(
+            self, f"Save {fmt.upper()} Report", default_name, filter_str
+        )
+        if not path_str:
+            return
+
+        path = Path(path_str)
+        try:
+            if fmt == "json":
+                save_json_report(completed, path)
+            else:
+                save_csv_report(completed, path)
+            self._log(f"{fmt.upper()} report saved to '{path}'.", "INFO")
+            QMessageBox.information(self, "Report Saved", f"Report saved to:\n{path}")
+        except Exception as exc:
+            self._log(f"Failed to save report: {exc}", "ERROR")
+            QMessageBox.critical(self, "Error", f"Could not save report:\n{exc}")
+
+    # ------------------------------------------------------------------
+    # Help menu
+    # ------------------------------------------------------------------
 
     def _show_about(self) -> None:
         QMessageBox.about(
@@ -392,7 +503,8 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "FFmpeg Status",
-                f"FFmpeg is available.\n\nPath: {self._ffmpeg_info.path}\nVersion: {self._ffmpeg_info.version}",
+                f"FFmpeg is available.\n\nPath: {self._ffmpeg_info.path}\n"
+                f"Version: {self._ffmpeg_info.version}",
             )
         else:
             self._show_ffmpeg_missing()
@@ -407,8 +519,17 @@ class MainWindow(QMainWindow):
         self._btn_convert.setEnabled(False)
 
     # ------------------------------------------------------------------
-    # Logging
+    # Helpers
     # ------------------------------------------------------------------
+
+    def _get_selected_paths(self) -> list[str]:
+        rows = self._table.selectionModel().selectedRows()
+        paths = []
+        for index in rows:
+            item = self._table.item(index.row(), 0)
+            if item:
+                paths.append(item.data(Qt.ItemDataRole.UserRole))
+        return paths
 
     def _log(self, message: str, level: str = "INFO") -> None:
         self._log_panel.append_log(message, level)

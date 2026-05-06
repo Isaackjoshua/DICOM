@@ -1,6 +1,40 @@
 # Changelog
 
-## [Unreleased] — Phase 2 Real-world Robustness
+## [Unreleased] — Phase 3 UX & Extras
+
+### Added
+- `services/batch_service.py` — `BatchJob` / `BatchQueue` data model: per-job status
+  (`queued → running → done / failed / cancelled`), timing, stats, `get_by_path`,
+  `clear_completed`
+- `services/anonymizer.py` — full DICOM PHI removal following DICOM Basic Application
+  Level Confidentiality Profile: replace PatientName/ID/DOB/institution, regenerate
+  SOPInstanceUID/StudyInstanceUID/SeriesInstanceUID, blank date tags, delete private
+  tags; `write_anonymized_copy`, `get_phi_summary`
+- `services/report_service.py` — JSON and CSV per-job processing reports with
+  summary (total/done/failed/cancelled, frame count, duration, generated_at timestamp)
+- `tests/test_anonymizer.py` — 10 tests: PHI replacement, UID regeneration, pixel
+  preservation, no mutation of original, file round-trip
+- `tests/test_batch_service.py` — 13 tests: add, remove, update, clear, stats,
+  duration, get_by_path, is_terminal, clear_all
+- `tests/test_report_service.py` — 7 tests: JSON/CSV output, summary counts,
+  required columns, ISO timestamps, error field
+
+### Changed
+- `services/conversion_service.py` — `ConversionResult` gains `started_at`,
+  `finished_at` (epoch floats) and `duration_seconds` property; all exit paths
+  stamp `finished_at`
+- `ui/worker.py` — **fixed cancel bug** (removed `_cancel.clear()` that would
+  re-enable subsequent files); added `file_started` signal; worker now operates on
+  `BatchQueue` not a raw list; remaining queued jobs are marked `cancelled` when
+  batch is aborted
+- `ui/main_window.py` — full Phase 3 wiring: `BatchQueue` as authoritative data
+  model; per-row status colouring (Running=cyan, Done=green, Failed=red,
+  Cancelled=yellow); Tools menu → "Anonymize Copy…", "Export JSON Report…",
+  "Export CSV Report…"; cancel now correctly stops all remaining files
+
+---
+
+## Phase 2 Real-world Robustness
 
 ### Added
 - `utils/handlers.py` — pydicom handler priority (pylibjpeg → rle → numpy → gdcm) configured at startup
