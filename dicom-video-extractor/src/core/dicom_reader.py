@@ -1,6 +1,7 @@
 """DICOM file validation, dataset loading, and transfer syntax detection."""
 
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -197,3 +198,31 @@ def _detect_spatial_stack(ds: pydicom.Dataset, warnings: list[str]) -> bool:
     )
     logger.warning("'%s' appears to be a spatial stack, not a cine loop.", getattr(ds, "filename", "?"))
     return True
+
+
+def patient_output_path(src: Path, out_root: Path, extension: str) -> Path:
+    """
+    Build an organised output path:
+        out_root / <PatientID> / <StudyDate> / <original_stem>.<ext>
+
+    Falls back to "UNKNOWN_PATIENT" / "UNKNOWN_DATE" when tags are absent.
+    Characters unsafe for filesystems are replaced with underscores.
+    """
+    try:
+        ds = pydicom.dcmread(str(src), stop_before_pixels=True)
+        patient_id = str(getattr(ds, "PatientID", "") or "").strip()
+        study_date = str(getattr(ds, "StudyDate", "") or "").strip()
+    except Exception:
+        patient_id = ""
+        study_date = ""
+
+    def _sanitize(s: str, fallback: str) -> str:
+        s = s.strip()
+        if not s:
+            return fallback
+        return re.sub(r'[^\w\-]', '_', s)
+
+    pid_dir = _sanitize(patient_id, "UNKNOWN_PATIENT")
+    date_dir = _sanitize(study_date, "UNKNOWN_DATE")
+    ext = extension.lstrip(".")
+    return out_root / pid_dir / date_dir / f"{src.stem}.{ext}"

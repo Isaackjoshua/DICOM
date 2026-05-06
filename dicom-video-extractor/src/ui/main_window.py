@@ -26,7 +26,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from src.core.dicom_reader import DicomFileInfo, validate_and_load
+from src.core.dicom_reader import DicomFileInfo, patient_output_path, validate_and_load
 from src.core.fps_resolver import FpsResult, resolve_fps
 from src.services.anonymizer import write_anonymized_copy
 from src.services.batch_service import BatchJob, BatchQueue
@@ -146,6 +146,15 @@ class MainWindow(QMainWindow):
             "(zero re-encode). Enable this to decode and re-encode instead."
         )
         details_layout.addWidget(self._force_reencode_chk)
+
+        self._organize_chk = QCheckBox("Organize output by patient")
+        self._organize_chk.setChecked(True)
+        self._organize_chk.setToolTip(
+            "Place each output video under:\n"
+            "  <Output Folder> / <PatientID> / <StudyDate> / <file>.mp4\n\n"
+            "When unchecked, all videos are written flat into the output folder."
+        )
+        details_layout.addWidget(self._organize_chk)
 
         details_layout.addWidget(QLabel("Output Folder:"))
         out_row = QHBoxLayout()
@@ -337,11 +346,24 @@ class MainWindow(QMainWindow):
         fps_override = self._fps_spin.value() if self._fps_spin.value() > 0 else None
         force_reencode = self._force_reencode_chk.isChecked()
 
+        organize = self._organize_chk.isChecked()
+        if organize and not self._output_dir:
+            QMessageBox.warning(
+                self, "Output Folder Required",
+                "\"Organize output by patient\" is enabled.\n\n"
+                "Please select an Output Folder first so the\n"
+                "PatientID/StudyDate sub-folders have somewhere to go."
+            )
+            return
+
         # Build a fresh BatchQueue from the current file list
         self._queue.clear_all()
         for path_str, info in self._file_infos.items():
-            out_dir = self._output_dir or info.path.parent
-            out_path = out_dir / (info.path.stem + f".{fmt}")
+            if organize and self._output_dir:
+                out_path = patient_output_path(info.path, self._output_dir, fmt)
+            else:
+                out_dir = self._output_dir or info.path.parent
+                out_path = out_dir / (info.path.stem + f".{fmt}")
             req = ConversionRequest(
                 input_path=info.path,
                 output_path=out_path,
