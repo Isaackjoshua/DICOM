@@ -14,7 +14,7 @@ A production-grade desktop application that extracts pixel data from multi-frame
 - Quality presets: Lossless, High, Compressed
 - Output formats: MP4, AVI, MKV
 - Dark-themed PyQt6 UI with per-file progress and log panel
-- DICOM metadata viewer with PHI highlighting
+- DICOM metadata viewer with PHI highlighting..
 
 ---
 
